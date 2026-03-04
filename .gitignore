@@ -1,0 +1,60 @@
+# ==============================
+# Rust
+# ==============================
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# If this is a binary/backend app, you SHOULD commit Cargo.lock.
+# Comment the above line if this is an application:
+#! Cargo.lock
+
+# ==============================
+# Environment Files
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Logs
+# ==============================
+*.log
+logs/
+tracing.log
+
+# ==============================
+# Database
+# ==============================
+*.sqlite
+*.db
+
+# SQLx
+.sqlx/
+
+# ==============================
+# Docker
+# ==============================
+docker-compose.override.yml
+
+# ==============================
+# IDE / Editor
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ==============================
+# Coverage / Testing
+# ==============================
+coverage/
+*.profraw
+*.profdata
+
+# ==============================
+# Build Artifacts
+# ==============================
+dist/
+build/

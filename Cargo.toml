@@ -1,0 +1,23 @@
+[package]
+name = "algo-trading-bot-using-kiteconnect"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+kiteconnect = "0.2.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+webbrowser = "1"
+url = "2"
+csv = "1"
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+plotters = { version = "0.3.7", features = ["chrono"] }
+log = "0.4"
+env_logger = "0.11"

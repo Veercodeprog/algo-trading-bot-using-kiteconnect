@@ -1,0 +1,158 @@
+This project is a CLI wrapper over Zerodha Kite Connect APIs.
+​
+Run commands with Cargo like: cargo run -- <subcommand> [flags...] (everything after -- is passed to your binary).
+​
+
+How to run
+Show all commands: cargo run -- --help (Cargo passes args after -- to the program).
+​
+
+Show help for one command: cargo run -- history --help.
+​
+
+Many “danger” commands require env safety gates like LIVE_TRADING_ENABLED=true or ORDER_LIVE_ENABLED=true so you don’t place real trades by accident.
+​
+
+Auth & session commands
+These commands manage login/session and read user profile/margins.
+​
+
+Command	Run	Plain-English meaning	Kite API used
+Auth	cargo run -- auth	Starts the login flow, stores your access token, then verifies it by fetching your profile.
+​	POST /session/token (get access_token), GET /user/profile (who you are).
+​
+Logout	cargo run -- logout	Logs out and invalidates the current API session/token (and your code also deletes the local token file).
+​	DELETE /session/token.
+​
+Run	cargo run -- run	“Startup demo”: loads instruments, prints LTP/OHLC/Quote snapshots, prints profile, then starts your internal bot loop.
+GET /instruments (instrument dump), GET /quote/ltp, GET /quote/ohlc, GET /quote, GET /user/profile.
+Margins	cargo run -- margins	Prints your available funds/margins (equity/commodity segments depending on call).
+​	GET /user/margins/:segment.
+​
+Market data & historical data
+These commands fetch current quotes, stream ticks, or download historical candles.
+
+Command	Run	Plain-English meaning	Kite API used
+SpamLtp	cargo run -- spam-ltp --count 200 --instrument NSE:INFY	Intentionally spams LTP requests to demonstrate rate-limit failures (learning-only).
+​	GET /quote/ltp.
+​
+ThrottleLtp	cargo run -- throttle-ltp --count 5 --sleep-ms 1100 --instruments NSE:INFY,NSE:RELIANCE	Repeats LTP fetches slowly and in batches (the recommended pattern).
+​	GET /quote/ltp (supports multiple instruments per call).
+​
+Ticker	cargo run -- ticker	Opens Kite WebSocket and prints live ticks for tokens from .env (TICKER_TOKENS), using mode ltp/quote/full.
+​	WebSocket streaming (subscribe + receive ticks).
+​
+History	cargo run -- history --exchange NSE --symbol INFY --interval day --days 90 --out historical.csv	Downloads historical OHLC candles for the symbol and writes a CSV.
+​	GET /instruments/historical/:instrument_token/:interval.
+​
+HistoryMtfPlot	cargo run -- history-mtf-plot --exchange NSE --symbol INFY --days 5 --out mtf.png	Downloads multiple timeframes and generates a PNG plot.
+​	GET /instruments/historical/:instrument_token/:interval (called multiple times for different intervals).
+​
+NiftyFutOi	cargo run -- nifty-fut-oi --from 2024-05-01 --to 2024-05-31 --out-csv nifty.csv --out-png nifty.png	Finds the front-month NIFTY future and downloads continuous daily candles with OI, then plots Close vs OI.
+​	Historical candles endpoint with continuous=1 and oi=1 (OI is supported via this flag).
+​
+LowfreqSma	cargo run -- lowfreq-sma	A “polling” strategy: every N seconds it fetches daily candles and computes SMA(200), then prints potential signals.
+Historical candles endpoint + timer interval loop.
+Portfolio & holdings
+These commands read portfolio/positions/holdings (generally safe: no trading).
+
+Command	Run	Plain-English meaning	Kite API used
+Positions	cargo run -- positions	Prints your open positions (day/net).
+​	Portfolio positions endpoint (positions).
+​
+Holdings	cargo run -- holdings	Prints your equity holdings table (qty, avg, last, pnl).
+​	Portfolio holdings endpoint.
+​
+HoldingsSummary	cargo run -- holdings-summary	Computes totals: invested value, current value, and total P&L from holdings.
+​	Same holdings endpoint + local math.
+​
+MfHoldings	cargo run -- mf-holdings	Prints mutual fund holdings from Coin-linked MF APIs.
+​	Mutual fund holdings endpoint (/mf/holdings).
+​
+Trading, orders, GTT, and “danger” commands
+These can place/modify/cancel orders or change portfolio state, so keep safety flags off until you’re ready.
+
+A) Live strategy execution
+Command	Run	Plain-English meaning	Kite API used
+LiveSmaTrader	cargo run -- live-sma-trader	Streams ticks, generates SMA crossover signals, and (if enabled via env) places real orders and polls order status.
+WebSocket streaming + POST /orders/regular + order history endpoints.
+ConvertMisToCnc	cargo run -- convert-mis-to-cnc	Converts an open position’s product type (e.g., MIS → CNC) using .env settings.
+​	Portfolio conversion endpoint (convert position).
+​
+B) Simple order demos
+Command	Run	Plain-English meaning	Kite API used
+OrderDemo	cargo run -- order-demo	Places a real MARKET BUY and then MARKET SELL using env defaults (only when ORDER_DEMO_ENABLED=true).
+​	POST /orders/regular (place order).
+​
+OrderLimitManageDemo	cargo run -- order-limit-manage-demo	End-to-end order management demo: place LIMIT, list orders, modify, cancel, show order history + trades.
+​	Orders API for place/modify/cancel + orderbook/tradebook.
+​
+C) Stop-loss orders (exits)
+Command	Run	Plain-English meaning	Kite API used
+PlaceSlm	cargo run -- place-slm --exchange NSE --symbol INFY --qty 10 --trigger 1540 --product MIS	Places a stop-loss market exit SELL (SL-M): when trigger hits, it becomes a market sell.
+​	POST /orders/:variety with order_type=SL-M and trigger_price.
+PlaceSl	cargo run -- place-sl --exchange NSE --symbol INFY --qty 10 --trigger 1540 --price 1539.5 --product MIS	Places a stop-loss limit exit SELL (SL): when trigger hits, it places a limit sell at your limit price.
+​	POST /orders/:variety with order_type=SL, trigger_price, and price.
+D) Advanced order varieties
+Kite uses the same “place order” API shape, where :variety changes behavior (e.g., co, amo, iceberg).
+​
+
+Command	Run	Plain-English meaning	Kite API used
+CoDemo	cargo run -- co-demo	Places a Cover Order (intraday entry with a linked mandatory stop-loss trigger).
+​	POST /orders/co.
+​
+AmoDemo	cargo run -- amo-demo	Places an After Market Order (order variety AMO).
+​	POST /orders/amo.
+​
+IcebergDemo	cargo run -- iceberg-demo	Places an Iceberg order (splits a large order into smaller disclosed legs).
+​	POST /orders/iceberg (with iceberg params).
+​
+E) GTT triggers (Good Till Triggered)
+GTT creates triggers that place orders later when price conditions are met.
+​
+
+Command	Run	Plain-English meaning	Kite API used
+GttSingleDemo	cargo run -- gtt-single-demo	Places a single trigger GTT (one trigger price → one order).
+​	POST /gtt/triggers with type=single.
+​
+GttOcoDemo	cargo run -- gtt-oco-demo	Places an OCO (“two-leg”) GTT: two trigger prices, and when one executes the other is canceled.
+​	POST /gtt/triggers with type=two-leg.
+​
+F) Margin estimation (what it would cost)
+Command	Run	Plain-English meaning	Kite API used
+(used internally) Margin check	(no dedicated subcommand in your enum right now)	Asks Kite “how much margin would this order require?” without placing it.
+​	POST /margins/orders.
+​
+Quick “run everything” checklist
+Safe (read-only) sequence:
+
+bash
+cargo run -- auth
+cargo run -- run
+cargo run -- margins
+cargo run -- positions
+cargo run -- holdings
+cargo run -- holdings-summary
+cargo run -- mf-holdings
+cargo run -- history --exchange NSE --symbol INFY --interval day --days 30 --out infy_30d.csv
+cargo run -- lowfreq-sma
+cargo run -- ticker
+Market data endpoints used here include quote snapshots and historical candles.
+
+Danger (places/changes orders) — only after enabling env safety flags:
+
+bash
+cargo run -- order-demo
+cargo run -- order-limit-manage-demo
+cargo run -- place-slm --trigger 1540
+cargo run -- place-sl --trigger 1540 --price 1539.5
+cargo run -- co-demo
+cargo run -- amo-demo
+cargo run -- iceberg-demo
+cargo run -- gtt-single-demo
+cargo run -- gtt-oco-demo
+cargo run -- live-sma-trader
+cargo run -- convert-mis-to-cnc
+These rely on Kite’s Orders, GTT, and Portfolio APIs.
+
+
