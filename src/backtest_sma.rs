@@ -1,29 +1,110 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, NaiveDate, TimeZone};
+use csv::Writer;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Write;
+use std::env;
 
-use crate::{history, instruments};
+const IST_SECS: i32 = 5 * 3600 + 30 * 60;
+
+fn ist() -> FixedOffset {
+    FixedOffset::east_opt(IST_SECS).unwrap()
+}
 
 #[derive(Debug, Clone)]
-struct LocalBar {
+struct Candle {
     ts: DateTime<FixedOffset>,
     open: f64,
     high: f64,
     low: f64,
     close: f64,
+    volume: f64,
+    oi: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategyKind {
+    Sma,
+    Rmi,
+}
+
+impl StrategyKind {
+    fn from_env() -> Self {
+        match env::var("BACKTEST_STRATEGY")
+            .unwrap_or_else(|_| "sma".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "rmi" => StrategyKind::Rmi,
+            _ => StrategyKind::Sma,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            StrategyKind::Sma => "sma",
+            StrategyKind::Rmi => "rmi",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Config {
+    instrument_token: u32,
+    symbol: String,
+    exchange: String,
+    interval: String,
+    from: DateTime<FixedOffset>,
+    to: DateTime<FixedOffset>,
+
+    strategy: StrategyKind,
+
+    fast_sma: usize,
+    slow_sma: usize,
+
+    rmi_length: usize,
+    rmi_momentum: usize,
+    rmi_buy_level: f64,
+    rmi_sell_level: f64,
+    enable_rmi_exit: bool,
+
+    start_capital: f64,
+    commission_pct: f64,
+    slippage_pct: f64,
+
+    enable_sma_exit: bool,
+    enable_stop_loss: bool,
+    stop_loss_pct: f64,
+    enable_take_profit: bool,
+    take_profit_pct: f64,
+    enable_trailing_stop: bool,
+    trailing_stop_pct: f64,
+    force_exit_end: bool,
+
+    continuous: bool,
+    oi: bool,
+
+    out_csv: String,
+    yearly_returns_csv: String,
+}
+
+#[derive(Debug, Clone)]
+struct OpenPosition {
+    entry_ts: DateTime<FixedOffset>,
+    entry_price: f64,
+    qty: f64,
+    highest_high: f64,
 }
 
 #[derive(Debug, Clone)]
 struct Trade {
-    entry_bar: usize,
-    exit_bar: usize,
+    strategy: String,
     entry_ts: DateTime<FixedOffset>,
     exit_ts: DateTime<FixedOffset>,
-    qty: u64,
     entry_price: f64,
     exit_price: f64,
+    qty: f64,
     gross_pnl: f64,
     net_pnl: f64,
     pnl_pct: f64,
@@ -31,687 +112,706 @@ struct Trade {
 }
 
 #[derive(Debug, Clone)]
-struct EquityPoint {
-    ts: DateTime<FixedOffset>,
-    equity: f64,
-}
-
-#[derive(Debug, Clone)]
 struct YearlyReturn {
     year: i32,
-    from_ts: DateTime<FixedOffset>,
-    to_ts: DateTime<FixedOffset>,
     start_equity: f64,
     end_equity: f64,
     return_pct: f64,
 }
 
-#[derive(Debug, Clone)]
-struct BacktestSummary {
-    symbol: String,
-    exchange: String,
-    interval: String,
-    fast_sma: usize,
-    slow_sma: usize,
-    start_capital: f64,
-    final_equity: f64,
-    total_return_pct: f64,
-    total_trades: usize,
-    winning_trades: usize,
-    losing_trades: usize,
-    win_rate_pct: f64,
-    max_drawdown_pct: f64,
-    yearly_returns: Vec<YearlyReturn>,
+#[derive(Debug, Deserialize)]
+struct HistoricalResponse {
+    status: String,
+    data: Option<HistoricalData>,
+    error_type: Option<String>,
+    message: Option<String>,
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+#[derive(Debug, Deserialize)]
+struct HistoricalData {
+    candles: Vec<Vec<serde_json::Value>>,
 }
 
-fn env_parse<T>(key: &str, default: T) -> T
-where
-    T: std::str::FromStr + Copy,
-{
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<T>().ok())
-        .unwrap_or(default)
-}
+pub async fn run_backtest_sma(api_key: &str, access_token: &str) -> Result<()> {
+    let cfg = load_config()?;
 
-fn env_bool(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "y"
-        ),
-        Err(_) => default,
+    println!(
+        "Running backtest for {}:{} token={} strategy={} interval={} from={} to={}",
+        cfg.exchange,
+        cfg.symbol,
+        cfg.instrument_token,
+        cfg.strategy.as_str(),
+        cfg.interval,
+        cfg.from,
+        cfg.to
+    );
+    println!(
+        "Config: fast_sma={} slow_sma={} rmi_length={} rmi_momentum={} start_capital={:.2} commission_pct={:.4} slippage_pct={:.4}",
+        cfg.fast_sma,
+        cfg.slow_sma,
+        cfg.rmi_length,
+        cfg.rmi_momentum,
+        cfg.start_capital,
+        cfg.commission_pct,
+        cfg.slippage_pct
+    );
+    println!(
+        "Exits: sma_exit={} rmi_exit={} stop_loss={}({:.2}%) take_profit={}({:.2}%) trailing_stop={}({:.2}%) force_exit_end={}",
+        cfg.enable_sma_exit,
+        cfg.enable_rmi_exit,
+        cfg.enable_stop_loss,
+        cfg.stop_loss_pct,
+        cfg.enable_take_profit,
+        cfg.take_profit_pct,
+        cfg.enable_trailing_stop,
+        cfg.trailing_stop_pct,
+        cfg.force_exit_end
+    );
+
+    let candles = fetch_historical_chunked(api_key, access_token, &cfg).await?;
+    if candles.len() < 10 {
+        bail!("not enough candles fetched");
     }
-}
 
-fn fmt_ts(ts: &DateTime<FixedOffset>) -> String {
-    ts.format("%Y-%m-%d %H:%M:%S %:z").to_string()
-}
+    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+    let sma_fast = sma(&closes, cfg.fast_sma);
+    let sma_slow = sma(&closes, cfg.slow_sma);
+    let rmi_vals = rmi(&closes, cfg.rmi_momentum, cfg.rmi_length);
 
-fn sma_at(closes: &[f64], period: usize, idx: usize) -> Option<f64> {
-    if period == 0 || idx + 1 < period {
-        return None;
-    }
-    let start = idx + 1 - period;
-    let sum: f64 = closes[start..=idx].iter().sum();
-    Some(sum / period as f64)
-}
+    let (trades, equity_curve) = run_backtest(&cfg, &candles, &sma_fast, &sma_slow, &rmi_vals)?;
+    let yearly = build_yearly_returns(&equity_curve);
 
-fn write_trades_csv(path: &str, trades: &[Trade]) -> Result<()> {
-    let mut f = File::create(path).with_context(|| format!("failed to create {path}"))?;
-    writeln!(
-        f,
-        "entry_bar,exit_bar,entry_date,exit_date,qty,entry_price,exit_price,gross_pnl,net_pnl,pnl_pct,exit_reason"
-    )?;
+    write_trades_csv(&cfg.out_csv, &trades)?;
+    write_yearly_returns_csv(&cfg.yearly_returns_csv, &yearly)?;
 
-    for t in trades {
-        writeln!(
-            f,
-            "{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{}",
-            t.entry_bar,
-            t.exit_bar,
-            fmt_ts(&t.entry_ts),
-            fmt_ts(&t.exit_ts),
-            t.qty,
+    for t in &trades {
+        println!(
+            "[{}] BUY {} @ {:.2} -> SELL {} @ {:.2} qty={:.4} pnl={:.2} ({:.2}%) reason={}",
+            t.strategy,
+            t.entry_ts,
             t.entry_price,
+            t.exit_ts,
             t.exit_price,
-            t.gross_pnl,
+            t.qty,
             t.net_pnl,
             t.pnl_pct,
             t.exit_reason
-        )?;
+        );
+    }
+
+    let final_equity = equity_curve
+        .last()
+        .map(|x| x.1)
+        .unwrap_or(cfg.start_capital);
+    let net_pnl = final_equity - cfg.start_capital;
+    let ret_pct = if cfg.start_capital > 0.0 {
+        (final_equity / cfg.start_capital - 1.0) * 100.0
+    } else {
+        0.0
+    };
+    let wins = trades.iter().filter(|t| t.net_pnl > 0.0).count();
+    let total = trades.len();
+    let win_rate = if total > 0 {
+        wins as f64 * 100.0 / total as f64
+    } else {
+        0.0
+    };
+
+    println!();
+    println!("========== SUMMARY ==========");
+    println!("Strategy: {}", cfg.strategy.as_str());
+    println!("Trades: {}", total);
+    println!("Win rate: {:.2}%", win_rate);
+    println!("Final equity: {:.2}", final_equity);
+    println!("Net PnL: {:.2}", net_pnl);
+    println!("Return: {:.2}%", ret_pct);
+    println!("Trades CSV: {}", cfg.out_csv);
+    println!("Yearly CSV: {}", cfg.yearly_returns_csv);
+
+    println!();
+    println!("====== YEARLY RETURNS ======");
+    for y in &yearly {
+        println!(
+            "{}  start={:.2} end={:.2} return={:.2}%",
+            y.year, y.start_equity, y.end_equity, y.return_pct
+        );
     }
 
     Ok(())
 }
 
-fn compute_yearly_returns(equity_curve: &[EquityPoint]) -> Vec<YearlyReturn> {
-    let mut yearly_map: BTreeMap<i32, Vec<&EquityPoint>> = BTreeMap::new();
+fn load_config() -> Result<Config> {
+    let now_ist = Local::now().with_timezone(&ist());
 
-    for p in equity_curve {
-        yearly_map.entry(p.ts.year()).or_default().push(p);
+    let lookback_years: i64 = env_parse("BACKTEST_LOOKBACK_YEARS", 5_i64)?;
+    let from = match env::var("BACKTEST_FROM") {
+        Ok(s) if !s.trim().is_empty() => parse_day_start(&s)?,
+        _ => now_ist - Duration::days(365 * lookback_years),
+    };
+    let to = match env::var("BACKTEST_TO") {
+        Ok(s) if !s.trim().is_empty() => parse_day_end(&s)?,
+        _ => now_ist,
+    };
+
+    Ok(Config {
+        instrument_token: env_parse("BACKTEST_INSTRUMENT_TOKEN", 738561_u32)?,
+        symbol: env::var("BACKTEST_SYMBOL").unwrap_or_else(|_| "RELIANCE".to_string()),
+        exchange: env::var("BACKTEST_EXCHANGE").unwrap_or_else(|_| "NSE".to_string()),
+        interval: env::var("BACKTEST_INTERVAL").unwrap_or_else(|_| "day".to_string()),
+
+        from,
+        to,
+        strategy: StrategyKind::from_env(),
+
+        fast_sma: env_parse("BACKTEST_FAST_SMA", 20_usize)?,
+        slow_sma: env_parse("BACKTEST_SLOW_SMA", 50_usize)?,
+
+        rmi_length: env_parse("BACKTEST_RMI_LENGTH", 14_usize)?,
+        rmi_momentum: env_parse("BACKTEST_RMI_MOMENTUM", 5_usize)?,
+        rmi_buy_level: env_parse("BACKTEST_RMI_BUY_LEVEL", 30.0_f64)?,
+        rmi_sell_level: env_parse("BACKTEST_RMI_SELL_LEVEL", 70.0_f64)?,
+        enable_rmi_exit: env_parse("BACKTEST_ENABLE_RMI_EXIT", true)?,
+
+        start_capital: env_parse("BACKTEST_START_CAPITAL", 100000.0_f64)?,
+        commission_pct: env_parse("BACKTEST_COMMISSION_PCT", 0.02_f64)?,
+        slippage_pct: env_parse("BACKTEST_SLIPPAGE_PCT", 0.01_f64)?,
+
+        enable_sma_exit: env_parse("BACKTEST_ENABLE_SMA_EXIT", true)?,
+        enable_stop_loss: env_parse("BACKTEST_ENABLE_STOP_LOSS", false)?,
+        stop_loss_pct: env_parse("BACKTEST_STOP_LOSS_PCT", 5.0_f64)?,
+        enable_take_profit: env_parse("BACKTEST_ENABLE_TAKE_PROFIT", false)?,
+        take_profit_pct: env_parse("BACKTEST_TAKE_PROFIT_PCT", 12.0_f64)?,
+        enable_trailing_stop: env_parse("BACKTEST_ENABLE_TRAILING_STOP", false)?,
+        trailing_stop_pct: env_parse("BACKTEST_TRAILING_STOP_PCT", 4.0_f64)?,
+        force_exit_end: env_parse("BACKTEST_FORCE_EXIT_AT_END", true)?,
+
+        continuous: env_parse("BACKTEST_CONTINUOUS", false)?,
+        oi: env_parse("BACKTEST_OI", false)?,
+
+        out_csv: env::var("BACKTEST_OUT_CSV").unwrap_or_else(|_| "backtest_trades.csv".to_string()),
+        yearly_returns_csv: env::var("BACKTEST_YEARLY_RETURNS_CSV")
+            .unwrap_or_else(|_| "backtest_yearly_returns.csv".to_string()),
+    })
+}
+
+fn parse_day_start(s: &str) -> Result<DateTime<FixedOffset>> {
+    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("invalid date for start: {s}"))?;
+    Ok(ist()
+        .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .ok_or_else(|| anyhow!("invalid local start datetime"))?)
+}
+
+fn parse_day_end(s: &str) -> Result<DateTime<FixedOffset>> {
+    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("invalid date for end: {s}"))?;
+    Ok(ist()
+        .from_local_datetime(&d.and_hms_opt(23, 59, 59).unwrap())
+        .single()
+        .ok_or_else(|| anyhow!("invalid local end datetime"))?)
+}
+
+fn env_parse<T>(key: &str, default: T) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v
+            .parse::<T>()
+            .map_err(|e| anyhow!("failed to parse {key}={v}: {e}")),
+        _ => Ok(default),
+    }
+}
+
+fn max_days_per_request(interval: &str) -> i64 {
+    match interval {
+        "minute" | "2minute" => 60,
+        "3minute" | "4minute" | "5minute" | "10minute" => 100,
+        "15minute" | "30minute" => 200,
+        "60minute" | "hour" | "2hour" | "3hour" | "4hour" => 400,
+        "day" | "week" => 2000,
+        _ => 200,
+    }
+}
+
+async fn fetch_historical_chunked(
+    api_key: &str,
+    access_token: &str,
+    cfg: &Config,
+) -> Result<Vec<Candle>> {
+    let client = reqwest::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Kite-Version", HeaderValue::from_static("3"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("token {}:{}", api_key, access_token))?,
+    );
+
+    let step_days = max_days_per_request(&cfg.interval) - 1;
+    let mut start = cfg.from;
+    let mut all = Vec::<Candle>::new();
+
+    while start <= cfg.to {
+        let end = std::cmp::min(start + Duration::days(step_days), cfg.to);
+        println!("Fetching chunk: {} -> {}", start, end);
+
+        let chunk = fetch_historical_one(
+            &client,
+            &headers,
+            cfg.instrument_token,
+            &cfg.interval,
+            start,
+            end,
+            cfg.continuous,
+            cfg.oi,
+        )
+        .await?;
+
+        all.extend(chunk);
+
+        if end >= cfg.to {
+            break;
+        }
+        start = end + Duration::seconds(1);
     }
 
-    let mut out = Vec::new();
+    all.sort_by_key(|c| c.ts);
+    all.dedup_by(|a, b| a.ts == b.ts);
 
-    for (year, points) in yearly_map {
-        if points.is_empty() {
+    Ok(all)
+}
+
+async fn fetch_historical_one(
+    client: &reqwest::Client,
+    headers: &HeaderMap,
+    instrument_token: u32,
+    interval: &str,
+    from: DateTime<FixedOffset>,
+    to: DateTime<FixedOffset>,
+    continuous: bool,
+    oi: bool,
+) -> Result<Vec<Candle>> {
+    let url = format!(
+        "https://api.kite.trade/instruments/historical/{}/{}",
+        instrument_token, interval
+    );
+
+    let resp = client
+        .get(url)
+        .headers(headers.clone())
+        .query(&[
+            ("from", from.format("%Y-%m-%d %H:%M:%S").to_string()),
+            ("to", to.format("%Y-%m-%d %H:%M:%S").to_string()),
+            ("continuous", if continuous { "1" } else { "0" }.to_string()),
+            ("oi", if oi { "1" } else { "0" }.to_string()),
+        ])
+        .send()
+        .await
+        .context("historical request failed")?;
+
+    let status = resp.status();
+    let text = resp.text().await?;
+
+    if !status.is_success() {
+        bail!("historical failed (HTTP {}): {}", status, text);
+    }
+
+    let parsed: HistoricalResponse =
+        serde_json::from_str(&text).context("failed to parse historical response")?;
+
+    if parsed.status != "success" {
+        bail!(
+            "historical API error: type={:?} message={:?}",
+            parsed.error_type,
+            parsed.message
+        );
+    }
+
+    let data = parsed
+        .data
+        .ok_or_else(|| anyhow!("historical response missing data"))?;
+
+    let mut candles = Vec::with_capacity(data.candles.len());
+    for row in data.candles {
+        if row.len() < 6 {
             continue;
         }
 
-        let first = points.first().unwrap();
-        let last = points.last().unwrap();
+        let ts_str = row[0]
+            .as_str()
+            .ok_or_else(|| anyhow!("candle timestamp missing"))?;
 
-        let return_pct = if first.equity != 0.0 {
-            ((last.equity - first.equity) / first.equity) * 100.0
-        } else {
-            0.0
-        };
+        let ts = DateTime::parse_from_rfc3339(ts_str)
+            .or_else(|_| DateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%z"))
+            .with_context(|| format!("failed to parse timestamp: {ts_str}"))?;
 
-        out.push(YearlyReturn {
-            year,
-            from_ts: first.ts.clone(),
-            to_ts: last.ts.clone(),
-            start_equity: first.equity,
-            end_equity: last.equity,
-            return_pct,
+        candles.push(Candle {
+            ts,
+            open: as_f64(&row[1])?,
+            high: as_f64(&row[2])?,
+            low: as_f64(&row[3])?,
+            close: as_f64(&row[4])?,
+            volume: as_f64(&row[5])?,
+            oi: if row.len() > 6 {
+                Some(as_f64(&row[6])?)
+            } else {
+                None
+            },
         });
+    }
+
+    Ok(candles)
+}
+
+fn as_f64(v: &serde_json::Value) -> Result<f64> {
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|x| x as f64))
+        .ok_or_else(|| anyhow!("expected numeric value, got {}", v))
+}
+
+fn sma(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let mut out = vec![None; values.len()];
+    if period == 0 || values.len() < period {
+        return out;
+    }
+
+    let mut sum = 0.0;
+    for i in 0..values.len() {
+        sum += values[i];
+        if i >= period {
+            sum -= values[i - period];
+        }
+        if i + 1 >= period {
+            out[i] = Some(sum / period as f64);
+        }
+    }
+    out
+}
+
+fn rma(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let mut out = vec![None; values.len()];
+    if period == 0 || values.len() < period {
+        return out;
+    }
+
+    let mut sum = 0.0;
+    for v in values.iter().take(period) {
+        sum += *v;
+    }
+
+    let mut prev = sum / period as f64;
+    out[period - 1] = Some(prev);
+
+    for i in period..values.len() {
+        prev = ((period as f64 - 1.0) * prev + values[i]) / period as f64;
+        out[i] = Some(prev);
     }
 
     out
 }
 
-fn print_summary(summary: &BacktestSummary) {
-    println!("\n================ SMA BACKTEST SUMMARY ================");
-    println!(
-        "Instrument        : {}:{}",
-        summary.exchange, summary.symbol
-    );
-    println!("Interval          : {}", summary.interval);
-    println!(
-        "Strategy          : SMA {} / SMA {}",
-        summary.fast_sma, summary.slow_sma
-    );
-    println!("Start Capital     : {:.2}", summary.start_capital);
-    println!("Final Equity      : {:.2}", summary.final_equity);
-    println!("Total Return %    : {:.2}", summary.total_return_pct);
-    println!("Total Trades      : {}", summary.total_trades);
-    println!("Winning Trades    : {}", summary.winning_trades);
-    println!("Losing Trades     : {}", summary.losing_trades);
-    println!("Win Rate %        : {:.2}", summary.win_rate_pct);
-    println!("Max Drawdown %    : {:.2}", summary.max_drawdown_pct);
+fn rmi(closes: &[f64], momentum: usize, length: usize) -> Vec<Option<f64>> {
+    let n = closes.len();
+    let mut up = vec![0.0; n];
+    let mut down = vec![0.0; n];
 
-    println!("\n---------------- YEAR-WISE RETURNS ----------------");
-    println!(
-        "{:<8} {:<25} {:<25} {:>14} {:>14} {:>12}",
-        "Year", "From Date", "To Date", "Start Eq", "End Eq", "Return %"
-    );
-
-    for y in &summary.yearly_returns {
-        println!(
-            "{:<8} {:<25} {:<25} {:>14.2} {:>14.2} {:>12.2}",
-            y.year,
-            fmt_ts(&y.from_ts),
-            fmt_ts(&y.to_ts),
-            y.start_equity,
-            y.end_equity,
-            y.return_pct
-        );
+    if momentum == 0 || n <= momentum {
+        return vec![None; n];
     }
+
+    for i in momentum..n {
+        let diff = closes[i] - closes[i - momentum];
+        if diff > 0.0 {
+            up[i] = diff;
+        } else {
+            down[i] = -diff;
+        }
+    }
+
+    let avg_up = rma(&up, length);
+    let avg_down = rma(&down, length);
+
+    let mut out = vec![None; n];
+    for i in 0..n {
+        let Some(u) = avg_up[i] else { continue };
+        let Some(d) = avg_down[i] else { continue };
+
+        out[i] = if d == 0.0 {
+            Some(100.0)
+        } else {
+            let rm = u / d;
+            Some(100.0 * rm / (1.0 + rm))
+        };
+    }
+
+    out
 }
 
-fn resolve_date_range() -> Result<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
-    let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+fn run_backtest(
+    cfg: &Config,
+    candles: &[Candle],
+    sma_fast: &[Option<f64>],
+    sma_slow: &[Option<f64>],
+    rmi_vals: &[Option<f64>],
+) -> Result<(Vec<Trade>, Vec<(DateTime<FixedOffset>, f64)>)> {
+    let commission = cfg.commission_pct / 100.0;
+    let slippage = cfg.slippage_pct / 100.0;
 
-    let explicit_from = std::env::var("BACKTEST_FROM").ok();
-    let explicit_to = std::env::var("BACKTEST_TO").ok();
+    let mut cash = cfg.start_capital;
+    let mut pos: Option<OpenPosition> = None;
+    let mut trades = Vec::<Trade>::new();
+    let mut equity_curve = Vec::<(DateTime<FixedOffset>, f64)>::new();
 
-    if explicit_from.is_some() || explicit_to.is_some() {
-        let from_str = explicit_from.unwrap_or_else(|| "2006-01-01".to_string());
-        let to_str = explicit_to.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    for i in 1..candles.len() {
+        let prev = &candles[i - 1];
+        let cur = &candles[i];
 
-        let from_date = NaiveDate::parse_from_str(&from_str, "%Y-%m-%d")
-            .with_context(|| format!("invalid BACKTEST_FROM: {from_str}"))?;
-        let to_date = NaiveDate::parse_from_str(&to_str, "%Y-%m-%d")
-            .with_context(|| format!("invalid BACKTEST_TO: {to_str}"))?;
+        let mut exit_reason: Option<&str> = None;
+        let mut exit_price: Option<f64> = None;
 
-        let from_dt = ist
-            .from_local_datetime(&from_date.and_hms_opt(0, 0, 0).unwrap())
-            .single()
-            .context("invalid BACKTEST_FROM datetime")?;
-
-        let to_dt = ist
-            .from_local_datetime(&to_date.and_hms_opt(23, 59, 59).unwrap())
-            .single()
-            .context("invalid BACKTEST_TO datetime")?;
-
-        return Ok((from_dt, to_dt));
-    }
-
-    let lookback_years: i64 = env_parse("BACKTEST_LOOKBACK_YEARS", 20_i64);
-    if lookback_years <= 0 {
-        bail!("BACKTEST_LOOKBACK_YEARS must be > 0");
-    }
-
-    let to_dt = Local::now().with_timezone(&ist);
-    let from_dt = to_dt - Duration::days(lookback_years * 365);
-
-    Ok((from_dt, to_dt))
-}
-
-fn sell_exec_price(trigger_price: f64, slippage_pct: f64) -> f64 {
-    trigger_price * (1.0 - slippage_pct / 100.0)
-}
-
-fn calc_net_pnl(
-    qty: u64,
-    entry_price: f64,
-    exit_price: f64,
-    commission_pct: f64,
-) -> (f64, f64, f64) {
-    let gross_pnl = (exit_price - entry_price) * qty as f64;
-    let buy_fee = (qty as f64 * entry_price) * (commission_pct / 100.0);
-    let sell_fee = (qty as f64 * exit_price) * (commission_pct / 100.0);
-    let net_pnl = gross_pnl - buy_fee - sell_fee;
-    let pnl_pct = if entry_price > 0.0 {
-        ((exit_price - entry_price) / entry_price) * 100.0
-    } else {
-        0.0
-    };
-    (gross_pnl, net_pnl, pnl_pct)
-}
-
-pub async fn run_backtest_sma(
-    api_key: &str,
-    access_token: &str,
-    instruments_cache: &[instruments::Instrument],
-) -> Result<()> {
-    let exchange = env_or("BACKTEST_EXCHANGE", "NSE");
-    let symbol = env_or("BACKTEST_SYMBOL", "RELIANCE");
-    let interval = env_or("BACKTEST_INTERVAL", "day");
-
-    let fast_period: usize = env_parse("BACKTEST_FAST_SMA", 20usize);
-    let slow_period: usize = env_parse("BACKTEST_SLOW_SMA", 50usize);
-
-    let start_capital: f64 = env_parse("BACKTEST_START_CAPITAL", 100_000.0_f64);
-    let commission_pct: f64 = env_parse("BACKTEST_COMMISSION_PCT", 0.0_f64);
-    let slippage_pct: f64 = env_parse("BACKTEST_SLIPPAGE_PCT", 0.0_f64);
-
-    let enable_sma_exit = env_bool("BACKTEST_ENABLE_SMA_EXIT", true);
-
-    let enable_stop_loss = env_bool("BACKTEST_ENABLE_STOP_LOSS", false);
-    let stop_loss_pct: f64 = env_parse("BACKTEST_STOP_LOSS_PCT", 5.0_f64);
-
-    let enable_take_profit = env_bool("BACKTEST_ENABLE_TAKE_PROFIT", false);
-    let take_profit_pct: f64 = env_parse("BACKTEST_TAKE_PROFIT_PCT", 10.0_f64);
-
-    let enable_trailing_stop = env_bool("BACKTEST_ENABLE_TRAILING_STOP", false);
-    let trailing_stop_pct: f64 = env_parse("BACKTEST_TRAILING_STOP_PCT", 4.0_f64);
-
-    let allow_force_exit = env_bool("BACKTEST_FORCE_EXIT_AT_END", true);
-
-    let continuous = env_bool("BACKTEST_CONTINUOUS", false);
-    let oi = env_bool("BACKTEST_OI", false);
-
-    let out_csv = env_or("BACKTEST_OUT_CSV", "backtest_strategy_trades.csv");
-
-    if fast_period == 0 || slow_period == 0 {
-        bail!("BACKTEST_FAST_SMA and BACKTEST_SLOW_SMA must be > 0");
-    }
-    if fast_period >= slow_period {
-        bail!("BACKTEST_FAST_SMA must be smaller than BACKTEST_SLOW_SMA");
-    }
-    if start_capital <= 0.0 {
-        bail!("BACKTEST_START_CAPITAL must be > 0");
-    }
-    if stop_loss_pct < 0.0 || take_profit_pct < 0.0 || trailing_stop_pct < 0.0 {
-        bail!("stop/take-profit/trailing percentages must be >= 0");
-    }
-
-    let token = instruments::find_instrument_token(instruments_cache, &exchange, &symbol)
-        .with_context(|| format!("instrument_token not found for {exchange}:{symbol}"))?;
-
-    let (from_dt, to_dt) = resolve_date_range()?;
-
-    println!(
-        "Running backtest for {}:{} token={} interval={} from={} to={}",
-        exchange,
-        symbol,
-        token,
-        interval,
-        fmt_ts(&from_dt),
-        fmt_ts(&to_dt)
-    );
-    println!(
-        "Config: fast_sma={} slow_sma={} start_capital={:.2} commission_pct={:.4} slippage_pct={:.4}",
-        fast_period, slow_period, start_capital, commission_pct, slippage_pct
-    );
-    println!(
-        "Exits: sma_exit={} stop_loss={}({:.2}%) take_profit={}({:.2}%) trailing_stop={}({:.2}%) force_exit_end={}",
-        enable_sma_exit,
-        enable_stop_loss,
-        stop_loss_pct,
-        enable_take_profit,
-        take_profit_pct,
-        enable_trailing_stop,
-        trailing_stop_pct,
-        allow_force_exit
-    );
-
-    let candles = history::fetch_historical(
-        api_key,
-        access_token,
-        token,
-        &interval,
-        from_dt,
-        to_dt,
-        continuous,
-        oi,
-    )
-    .await?;
-
-    if candles.len() < slow_period + 2 {
-        bail!(
-            "not enough candles: got {}, need at least {}",
-            candles.len(),
-            slow_period + 2
-        );
-    }
-
-    let bars: Vec<LocalBar> = candles
-        .iter()
-        .map(|c| LocalBar {
-            ts: c.time,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-        })
-        .collect();
-
-    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-
-    let mut cash = start_capital;
-    let mut qty: u64 = 0;
-    let mut entry_price = 0.0;
-    let mut entry_bar = 0usize;
-    let mut entry_ts = bars[0].ts.clone();
-    let mut highest_high_since_entry = 0.0_f64;
-
-    let mut trades: Vec<Trade> = Vec::new();
-    let mut equity_curve: Vec<EquityPoint> = vec![EquityPoint {
-        ts: bars[0].ts.clone(),
-        equity: start_capital,
-    }];
-
-    let mut peak_equity = start_capital;
-    let mut max_drawdown_pct = 0.0_f64;
-
-    for i in 1..bars.len() {
-        let fast_prev = match sma_at(&closes, fast_period, i - 1) {
-            Some(v) => v,
-            None => {
-                let equity = if qty > 0 {
-                    cash + qty as f64 * bars[i].close
-                } else {
-                    cash
-                };
-                equity_curve.push(EquityPoint {
-                    ts: bars[i].ts.clone(),
-                    equity,
-                });
-                continue;
-            }
-        };
-
-        let slow_prev = match sma_at(&closes, slow_period, i - 1) {
-            Some(v) => v,
-            None => {
-                let equity = if qty > 0 {
-                    cash + qty as f64 * bars[i].close
-                } else {
-                    cash
-                };
-                equity_curve.push(EquityPoint {
-                    ts: bars[i].ts.clone(),
-                    equity,
-                });
-                continue;
-            }
-        };
-
-        let fast_now = match sma_at(&closes, fast_period, i) {
-            Some(v) => v,
-            None => {
-                let equity = if qty > 0 {
-                    cash + qty as f64 * bars[i].close
-                } else {
-                    cash
-                };
-                equity_curve.push(EquityPoint {
-                    ts: bars[i].ts.clone(),
-                    equity,
-                });
-                continue;
-            }
-        };
-
-        let slow_now = match sma_at(&closes, slow_period, i) {
-            Some(v) => v,
-            None => {
-                let equity = if qty > 0 {
-                    cash + qty as f64 * bars[i].close
-                } else {
-                    cash
-                };
-                equity_curve.push(EquityPoint {
-                    ts: bars[i].ts.clone(),
-                    equity,
-                });
-                continue;
-            }
-        };
-
-        let bar = &bars[i];
-        let buy_signal = fast_prev <= slow_prev && fast_now > slow_now;
-        let sell_signal = fast_prev >= slow_prev && fast_now < slow_now;
-
-        if qty == 0 && buy_signal {
-            let buy_px = bar.close * (1.0 + slippage_pct / 100.0);
-            let per_share_cost = buy_px * (1.0 + commission_pct / 100.0);
-            let buy_qty = (cash / per_share_cost).floor() as u64;
-
-            if buy_qty > 0 {
-                let total_cost = buy_qty as f64 * per_share_cost;
-                cash -= total_cost;
-                qty = buy_qty;
-                entry_price = buy_px;
-                entry_bar = i;
-                entry_ts = bar.ts.clone();
-                highest_high_since_entry = entry_price;
-
-                println!(
-                    "BUY  | date={} | bar={} | open={:.2} high={:.2} low={:.2} close={:.2} | exec={:.2} | qty={} | fast_sma={:.2} | slow_sma={:.2}",
-                    fmt_ts(&bar.ts),
-                    i,
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    buy_px,
-                    qty,
-                    fast_now,
-                    slow_now
-                );
-            }
-        } else if qty > 0 {
-            let prev_highest_high = highest_high_since_entry;
-
-            let stop_loss_level = if enable_stop_loss {
-                Some(entry_price * (1.0 - stop_loss_pct / 100.0))
-            } else {
-                None
-            };
-
-            let take_profit_level = if enable_take_profit {
-                Some(entry_price * (1.0 + take_profit_pct / 100.0))
-            } else {
-                None
-            };
-
-            let trailing_stop_level = if enable_trailing_stop && prev_highest_high > 0.0 {
-                Some(prev_highest_high * (1.0 - trailing_stop_pct / 100.0))
-            } else {
-                None
-            };
-
-            let mut exit_reason: Option<&str> = None;
-            let mut exit_price = 0.0_f64;
-
-            // Conservative candle-based priority:
-            // 1) hard stop-loss
-            // 2) trailing stop
-            // 3) take-profit
-            // 4) SMA crossover exit at close
-            if let Some(level) = stop_loss_level {
-                if bar.low <= level {
+        if let Some(p) = &pos {
+            if cfg.enable_stop_loss {
+                let stop = p.entry_price * (1.0 - cfg.stop_loss_pct / 100.0);
+                if cur.low <= stop {
                     exit_reason = Some("stop_loss");
-                    exit_price = sell_exec_price(level, slippage_pct);
+                    exit_price = Some(stop * (1.0 - slippage));
+                }
+            }
+
+            if exit_reason.is_none() && cfg.enable_trailing_stop {
+                let trail = p.highest_high * (1.0 - cfg.trailing_stop_pct / 100.0);
+                if cur.low <= trail {
+                    exit_reason = Some("trailing_stop");
+                    exit_price = Some(trail * (1.0 - slippage));
+                }
+            }
+
+            if exit_reason.is_none() && cfg.enable_take_profit {
+                let tp = p.entry_price * (1.0 + cfg.take_profit_pct / 100.0);
+                if cur.high >= tp {
+                    exit_reason = Some("take_profit");
+                    exit_price = Some(tp * (1.0 - slippage));
                 }
             }
 
             if exit_reason.is_none() {
-                if let Some(level) = trailing_stop_level {
-                    if bar.low <= level {
-                        exit_reason = Some("trailing_stop");
-                        exit_price = sell_exec_price(level, slippage_pct);
+                match cfg.strategy {
+                    StrategyKind::Sma => {
+                        if cfg.enable_sma_exit {
+                            if let (Some(pf), Some(ps), Some(cf), Some(cs)) =
+                                (sma_fast[i - 1], sma_slow[i - 1], sma_fast[i], sma_slow[i])
+                            {
+                                if pf >= ps && cf < cs {
+                                    exit_reason = Some("sma_cross_down");
+                                    exit_price = Some(cur.close * (1.0 - slippage));
+                                }
+                            }
+                        }
+                    }
+                    StrategyKind::Rmi => {
+                        if cfg.enable_rmi_exit {
+                            if let (Some(pr), Some(cr)) = (rmi_vals[i - 1], rmi_vals[i]) {
+                                if pr > cfg.rmi_sell_level && cr <= cfg.rmi_sell_level {
+                                    exit_reason = Some("rmi_cross_down");
+                                    exit_price = Some(cur.close * (1.0 - slippage));
+                                }
+                            }
+                        }
                     }
                 }
             }
+        }
 
-            if exit_reason.is_none() {
-                if let Some(level) = take_profit_level {
-                    if bar.high >= level {
-                        exit_reason = Some("take_profit");
-                        exit_price = sell_exec_price(level, slippage_pct);
-                    }
-                }
-            }
+        if let Some(reason) = exit_reason {
+            if let Some(p) = pos.take() {
+                let px = exit_price.unwrap();
+                let gross_value = p.qty * px;
+                let exit_fee = gross_value * commission;
+                cash += gross_value - exit_fee;
 
-            if exit_reason.is_none() && enable_sma_exit && sell_signal {
-                exit_reason = Some("sma_cross_down");
-                exit_price = sell_exec_price(bar.close, slippage_pct);
-            }
+                let gross_pnl = (px - p.entry_price) * p.qty;
+                let net_pnl =
+                    cash - cfg.start_capital - trades.iter().map(|t| t.net_pnl).sum::<f64>();
 
-            if let Some(reason) = exit_reason {
-                let gross_value = qty as f64 * exit_price;
-                let sell_fee = gross_value * (commission_pct / 100.0);
-                let net_value = gross_value - sell_fee;
-                cash += net_value;
-
-                let (gross_pnl, net_pnl, pnl_pct) =
-                    calc_net_pnl(qty, entry_price, exit_price, commission_pct);
+                let pnl_pct = if p.entry_price > 0.0 {
+                    (px / p.entry_price - 1.0) * 100.0
+                } else {
+                    0.0
+                };
 
                 trades.push(Trade {
-                    entry_bar,
-                    exit_bar: i,
-                    entry_ts: entry_ts.clone(),
-                    exit_ts: bar.ts.clone(),
-                    qty,
-                    entry_price,
-                    exit_price,
+                    strategy: cfg.strategy.as_str().to_string(),
+                    entry_ts: p.entry_ts,
+                    exit_ts: cur.ts,
+                    entry_price: p.entry_price,
+                    exit_price: px,
+                    qty: p.qty,
                     gross_pnl,
                     net_pnl,
                     pnl_pct,
                     exit_reason: reason.to_string(),
                 });
-
-                println!(
-                    "SELL | date={} | bar={} | reason={} | open={:.2} high={:.2} low={:.2} close={:.2} | exec={:.2} | qty={} | net_pnl={:.2} | pnl_pct={:.2} | fast_sma={:.2} | slow_sma={:.2}",
-                    fmt_ts(&bar.ts),
-                    i,
-                    reason,
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    exit_price,
-                    qty,
-                    net_pnl,
-                    pnl_pct,
-                    fast_now,
-                    slow_now
-                );
-
-                qty = 0;
-                entry_price = 0.0;
-                highest_high_since_entry = 0.0;
-            } else {
-                if bar.high > highest_high_since_entry {
-                    highest_high_since_entry = bar.high;
-                }
             }
         }
 
-        let equity = if qty > 0 {
-            cash + qty as f64 * bar.close
-        } else {
-            cash
-        };
-
-        if equity > peak_equity {
-            peak_equity = equity;
+        if let Some(p) = &mut pos {
+            if cur.high > p.highest_high {
+                p.highest_high = cur.high;
+            }
         }
 
-        let drawdown_pct = if peak_equity > 0.0 {
-            ((peak_equity - equity) / peak_equity) * 100.0
-        } else {
-            0.0
-        };
+        if pos.is_none() {
+            let buy_signal = match cfg.strategy {
+                StrategyKind::Sma => {
+                    if let (Some(pf), Some(ps), Some(cf), Some(cs)) =
+                        (sma_fast[i - 1], sma_slow[i - 1], sma_fast[i], sma_slow[i])
+                    {
+                        pf <= ps && cf > cs
+                    } else {
+                        false
+                    }
+                }
+                StrategyKind::Rmi => {
+                    if let (Some(pr), Some(cr)) = (rmi_vals[i - 1], rmi_vals[i]) {
+                        pr < cfg.rmi_buy_level && cr >= cfg.rmi_buy_level
+                    } else {
+                        false
+                    }
+                }
+            };
 
-        if drawdown_pct > max_drawdown_pct {
-            max_drawdown_pct = drawdown_pct;
+            if buy_signal && cash > 0.0 {
+                let entry_px = cur.close * (1.0 + slippage);
+                let qty = cash / (entry_px * (1.0 + commission));
+                let gross_cost = qty * entry_px;
+                let entry_fee = gross_cost * commission;
+                cash -= gross_cost + entry_fee;
+
+                pos = Some(OpenPosition {
+                    entry_ts: cur.ts,
+                    entry_price: entry_px,
+                    qty,
+                    highest_high: cur.high,
+                });
+            }
         }
 
-        equity_curve.push(EquityPoint {
-            ts: bar.ts.clone(),
-            equity,
-        });
+        let equity = match &pos {
+            Some(p) => cash + p.qty * cur.close,
+            None => cash,
+        };
+        equity_curve.push((cur.ts, equity));
     }
 
-    if qty > 0 && allow_force_exit {
-        let i = bars.len() - 1;
-        let bar = &bars[i];
-        let exit_price = sell_exec_price(bar.close, slippage_pct);
+    if cfg.force_exit_end {
+        if let (Some(last), Some(p)) = (candles.last(), pos.take()) {
+            let px = last.close * (1.0 - slippage);
+            let gross_value = p.qty * px;
+            let exit_fee = gross_value * commission;
+            cash += gross_value - exit_fee;
 
-        let gross_value = qty as f64 * exit_price;
-        let sell_fee = gross_value * (commission_pct / 100.0);
-        let net_value = gross_value - sell_fee;
-        cash += net_value;
+            let gross_pnl = (px - p.entry_price) * p.qty;
+            let net_pnl = cash - cfg.start_capital - trades.iter().map(|t| t.net_pnl).sum::<f64>();
+            let pnl_pct = if p.entry_price > 0.0 {
+                (px / p.entry_price - 1.0) * 100.0
+            } else {
+                0.0
+            };
 
-        let (gross_pnl, net_pnl, pnl_pct) =
-            calc_net_pnl(qty, entry_price, exit_price, commission_pct);
+            trades.push(Trade {
+                strategy: cfg.strategy.as_str().to_string(),
+                entry_ts: p.entry_ts,
+                exit_ts: last.ts,
+                entry_price: p.entry_price,
+                exit_price: px,
+                qty: p.qty,
+                gross_pnl,
+                net_pnl,
+                pnl_pct,
+                exit_reason: "force_exit_end".to_string(),
+            });
 
-        trades.push(Trade {
-            entry_bar,
-            exit_bar: i,
-            entry_ts: entry_ts.clone(),
-            exit_ts: bar.ts.clone(),
-            qty,
-            entry_price,
-            exit_price,
-            gross_pnl,
-            net_pnl,
-            pnl_pct,
-            exit_reason: "force_exit_end".to_string(),
-        });
-
-        println!(
-            "SELL | date={} | bar={} | reason=force_exit_end | open={:.2} high={:.2} low={:.2} close={:.2} | exec={:.2} | qty={} | net_pnl={:.2} | pnl_pct={:.2}",
-            fmt_ts(&bar.ts),
-            i,
-            bar.open,
-            bar.high,
-            bar.low,
-            bar.close,
-            exit_price,
-            qty,
-            net_pnl,
-            pnl_pct
-        );
-
-        qty = 0;
-        entry_price = 0.0;
-        highest_high_since_entry = 0.0;
-
-        equity_curve.push(EquityPoint {
-            ts: bar.ts.clone(),
-            equity: cash,
-        });
+            equity_curve.push((last.ts, cash));
+        }
     }
 
-    let final_equity = if qty > 0 {
-        cash + qty as f64 * bars.last().unwrap().close
-    } else {
-        cash
-    };
+    Ok((trades, equity_curve))
+}
 
-    let total_return_pct = ((final_equity - start_capital) / start_capital) * 100.0;
-    let total_trades = trades.len();
-    let winning_trades = trades.iter().filter(|t| t.net_pnl > 0.0).count();
-    let losing_trades = trades.iter().filter(|t| t.net_pnl <= 0.0).count();
-    let win_rate_pct = if total_trades > 0 {
-        (winning_trades as f64 / total_trades as f64) * 100.0
-    } else {
-        0.0
-    };
+fn build_yearly_returns(curve: &[(DateTime<FixedOffset>, f64)]) -> Vec<YearlyReturn> {
+    let mut years: BTreeMap<i32, (f64, f64)> = BTreeMap::new();
 
-    let yearly_returns = compute_yearly_returns(&equity_curve);
+    for (ts, equity) in curve {
+        years
+            .entry(ts.year())
+            .and_modify(|(_, end)| *end = *equity)
+            .or_insert((*equity, *equity));
+    }
 
-    let summary = BacktestSummary {
-        symbol,
-        exchange,
-        interval,
-        fast_sma: fast_period,
-        slow_sma: slow_period,
-        start_capital,
-        final_equity,
-        total_return_pct,
-        total_trades,
-        winning_trades,
-        losing_trades,
-        win_rate_pct,
-        max_drawdown_pct,
-        yearly_returns,
-    };
+    years
+        .into_iter()
+        .map(|(year, (start_equity, end_equity))| YearlyReturn {
+            year,
+            start_equity,
+            end_equity,
+            return_pct: if start_equity > 0.0 {
+                (end_equity / start_equity - 1.0) * 100.0
+            } else {
+                0.0
+            },
+        })
+        .collect()
+}
 
-    write_trades_csv(&out_csv, &trades)?;
-    print_summary(&summary);
-    println!("\nWrote trades CSV to {}", out_csv);
+fn write_trades_csv(path: &str, trades: &[Trade]) -> Result<()> {
+    let mut wtr = Writer::from_path(path)?;
+    wtr.write_record([
+        "strategy",
+        "entry_ts",
+        "exit_ts",
+        "entry_price",
+        "exit_price",
+        "qty",
+        "gross_pnl",
+        "net_pnl",
+        "pnl_pct",
+        "exit_reason",
+    ])?;
 
+    for t in trades {
+        wtr.write_record([
+            t.strategy.as_str(),
+            &t.entry_ts.to_rfc3339(),
+            &t.exit_ts.to_rfc3339(),
+            &format!("{:.6}", t.entry_price),
+            &format!("{:.6}", t.exit_price),
+            &format!("{:.6}", t.qty),
+            &format!("{:.6}", t.gross_pnl),
+            &format!("{:.6}", t.net_pnl),
+            &format!("{:.6}", t.pnl_pct),
+            t.exit_reason.as_str(),
+        ])?;
+    }
+
+    wtr.flush()?;
+    Ok(())
+}
+
+fn write_yearly_returns_csv(path: &str, rows: &[YearlyReturn]) -> Result<()> {
+    let mut wtr = Writer::from_path(path)?;
+    wtr.write_record(["year", "start_equity", "end_equity", "return_pct"])?;
+
+    for y in rows {
+        wtr.write_record([
+            y.year.to_string(),
+            format!("{:.6}", y.start_equity),
+            format!("{:.6}", y.end_equity),
+            format!("{:.6}", y.return_pct),
+        ])?;
+    }
+
+    wtr.flush()?;
     Ok(())
 }

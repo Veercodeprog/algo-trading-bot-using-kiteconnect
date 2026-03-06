@@ -886,15 +886,7 @@ async fn main() -> Result<()> {
         }
         Command::BacktestSma => {
             let tok = auth::ensure_token(&cfg).await?;
-
-            let instruments = instruments::load_or_download(
-                &cfg.api_key,
-                &tok.access_token,
-                "instruments_cache.bin",
-            )
-            .await?;
-
-            backtest_sma::run_backtest_sma(&cfg.api_key, &tok.access_token, &instruments).await?;
+            backtest_sma::run_backtest_sma(&cfg.api_key, &tok.access_token).await?;
         }
     }
 
