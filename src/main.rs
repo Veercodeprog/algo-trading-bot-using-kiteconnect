@@ -1,6 +1,7 @@
 // src/main.rs
 mod account;
 mod auth;
+mod backtest_sma;
 mod bot;
 mod broker;
 mod config;
@@ -62,6 +63,7 @@ enum Command {
     IcebergDemo,
     GttSingleDemo,
     GttOcoDemo,
+    BacktestSma,
 
     /// Anti-pattern demo: spam LTP to trigger rate-limit errors (for learning only)
     SpamLtp {
@@ -881,6 +883,18 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("GTT OCO placed. trigger_id={}", trigger_id);
+        }
+        Command::BacktestSma => {
+            let tok = auth::ensure_token(&cfg).await?;
+
+            let instruments = instruments::load_or_download(
+                &cfg.api_key,
+                &tok.access_token,
+                "instruments_cache.bin",
+            )
+            .await?;
+
+            backtest_sma::run_backtest_sma(&cfg.api_key, &tok.access_token, &instruments).await?;
         }
     }
 
